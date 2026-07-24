@@ -70,6 +70,7 @@ class SlitherlinkState:
         self._cycle_marks: List[bool] = []
         self._dirty_cells: set[Tuple[int, int]] = set()
         self._dirty_dots: set[Tuple[int, int]] = set()
+        self._dead_cache: set[bytes] = set()
 
     def _vertex_index(self, r: int, c: int) -> int:
         return r * (self.C + 1) + c
@@ -270,6 +271,17 @@ class SlitherlinkState:
                 if edges >= 4 and edges < total_line:
                     raise Contradiction()
 
+    def _state_key(self) -> bytes:
+        data = bytearray()
+        for row in self.h:
+            for v in row:
+                data.append(v + 1)
+        data.append(255)
+        for row in self.v:
+            for v in row:
+                data.append(v + 1)
+        return bytes(data)
+
     def propagate(self) -> None:
         self._queue_all()
         while self._dirty_cells or self._dirty_dots:
@@ -370,15 +382,25 @@ class SlitherlinkState:
         return score
 
     def solve(self) -> Optional["SlitherlinkState"]:
+        key = self._state_key()
+        if key in self._dead_cache:
+            return None
         try:
             self.propagate()
         except Contradiction:
+            self._dead_cache.add(key)
             return None
         if self.is_complete():
-            return self if self.is_valid_solution() else None
+            result = self if self.is_valid_solution() else None
+            if result is None:
+                self._dead_cache.add(key)
+            return result
         edge = self.find_unknown()
         if edge is None:
-            return self if self.is_valid_solution() else None
+            result = self if self.is_valid_solution() else None
+            if result is None:
+                self._dead_cache.add(key)
+            return result
         kind, r, c = edge
         for val in (self.LINE, self.CROSS):
             cp = self.save_state()
@@ -390,6 +412,7 @@ class SlitherlinkState:
             except Contradiction:
                 pass
             self.restore_state(cp)
+        self._dead_cache.add(key)
         return None
 
     def render(self) -> str:
