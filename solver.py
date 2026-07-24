@@ -367,96 +367,7 @@ class SlitherlinkState:
                 score += (4 - unknown) * 3 + known * 2
             else:
                 score += 1
-
-        # 额外偏好：靠近高约束点的边，通常更容易快速触发传播或矛盾
-        if kind == "h":
-            dot_a = (r, c)
-            dot_b = (r, c + 1)
-        else:
-            dot_a = (r, c)
-            dot_b = (r + 1, c)
-        for dr, dc in (dot_a, dot_b):
-            dot_vals = [self.get(k, rr, cc) for k, rr, cc in self.dot_edges(dr, dc)]
-            dot_line = dot_vals.count(self.LINE)
-            dot_unknown = dot_vals.count(self.UNKNOWN)
-            if dot_line == 1 and dot_unknown == 1:
-                score += 8
-            elif dot_line == 2:
-                score += 6
-            elif dot_unknown == 1:
-                score += 4
         return score
-
-    def _find_forced_edge(self) -> Optional[Tuple[str, int, int]]:
-        """优先返回已经被局部规则几乎锁死的边。"""
-        best = None
-        best_score = 0
-        for r in range(self.R + 1):
-            for c in range(self.C):
-                if self.h[r][c] != self.UNKNOWN:
-                    continue
-                score = self._edge_priority("h", r, c)
-                if score > best_score:
-                    best_score = score
-                    best = ("h", r, c)
-        for r in range(self.R):
-            for c in range(self.C + 1):
-                if self.v[r][c] != self.UNKNOWN:
-                    continue
-                score = self._edge_priority("v", r, c)
-                if score > best_score:
-                    best_score = score
-                    best = ("v", r, c)
-        return best
-
-    def _candidate_edges(self, limit: int = 8) -> List[Tuple[int, str, int, int]]:
-        """收集最值得尝试的候选边，按局部约束强度排序。"""
-        ranked: List[Tuple[int, str, int, int]] = []
-        for r in range(self.R + 1):
-            for c in range(self.C):
-                if self.h[r][c] == self.UNKNOWN:
-                    ranked.append((self._edge_priority("h", r, c), "h", r, c))
-        for r in range(self.R):
-            for c in range(self.C + 1):
-                if self.v[r][c] == self.UNKNOWN:
-                    ranked.append((self._edge_priority("v", r, c), "v", r, c))
-        ranked.sort(reverse=True)
-        return ranked[:limit]
-
-    def _branch_score(self, kind: str, r: int, c: int, val: int) -> Tuple[int, bool]:
-        """轻量试探某个分支的收益：更多推理通常意味着更好的分支。"""
-        cp = self.save_state()
-        try:
-            self.set(kind, r, c, val)
-            before = len(self._trail)
-            self.propagate()
-            after = len(self._trail)
-            return after - before, True
-        except Contradiction:
-            return -10**9, False
-        finally:
-            self.restore_state(cp)
-
-    def _choose_branch_edge(self) -> Optional[Tuple[str, int, int]]:
-        forced = self._find_forced_edge()
-        if forced is not None:
-            return forced
-
-        candidates = self._candidate_edges()
-        if not candidates:
-            return None
-
-        best_edge = None
-        best_key = None
-        for _, kind, r, c in candidates:
-            line_gain, line_ok = self._branch_score(kind, r, c, self.LINE)
-            cross_gain, cross_ok = self._branch_score(kind, r, c, self.CROSS)
-            contradiction_bonus = (0 if line_ok else 1) + (0 if cross_ok else 1)
-            key = (contradiction_bonus, max(line_gain, cross_gain), line_gain + cross_gain, self._edge_priority(kind, r, c))
-            if best_key is None or key > best_key:
-                best_key = key
-                best_edge = (kind, r, c)
-        return best_edge
 
     def solve(self) -> Optional["SlitherlinkState"]:
         try:
@@ -465,7 +376,7 @@ class SlitherlinkState:
             return None
         if self.is_complete():
             return self if self.is_valid_solution() else None
-        edge = self._choose_branch_edge() or self.find_unknown()
+        edge = self.find_unknown()
         if edge is None:
             return self if self.is_valid_solution() else None
         kind, r, c = edge
