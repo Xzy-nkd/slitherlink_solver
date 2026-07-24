@@ -367,7 +367,47 @@ class SlitherlinkState:
                 score += (4 - unknown) * 3 + known * 2
             else:
                 score += 1
+
+        # 额外偏好：靠近高约束点的边，通常更容易快速触发传播或矛盾
+        if kind == "h":
+            dot_a = (r, c)
+            dot_b = (r, c + 1)
+        else:
+            dot_a = (r, c)
+            dot_b = (r + 1, c)
+        for dr, dc in (dot_a, dot_b):
+            dot_vals = [self.get(k, rr, cc) for k, rr, cc in self.dot_edges(dr, dc)]
+            dot_line = dot_vals.count(self.LINE)
+            dot_unknown = dot_vals.count(self.UNKNOWN)
+            if dot_line == 1 and dot_unknown == 1:
+                score += 8
+            elif dot_line == 2:
+                score += 6
+            elif dot_unknown == 1:
+                score += 4
         return score
+
+    def _find_forced_edge(self) -> Optional[Tuple[str, int, int]]:
+        """优先返回已经被局部规则几乎锁死的边。"""
+        best = None
+        best_score = 0
+        for r in range(self.R + 1):
+            for c in range(self.C):
+                if self.h[r][c] != self.UNKNOWN:
+                    continue
+                score = self._edge_priority("h", r, c)
+                if score > best_score:
+                    best_score = score
+                    best = ("h", r, c)
+        for r in range(self.R):
+            for c in range(self.C + 1):
+                if self.v[r][c] != self.UNKNOWN:
+                    continue
+                score = self._edge_priority("v", r, c)
+                if score > best_score:
+                    best_score = score
+                    best = ("v", r, c)
+        return best
 
     def solve(self) -> Optional["SlitherlinkState"]:
         try:
@@ -376,7 +416,7 @@ class SlitherlinkState:
             return None
         if self.is_complete():
             return self if self.is_valid_solution() else None
-        edge = self.find_unknown()
+        edge = self._find_forced_edge() or self.find_unknown()
         if edge is None:
             return self if self.is_valid_solution() else None
         kind, r, c = edge
