@@ -71,6 +71,14 @@ class SlitherlinkState:
         self._dirty_cells: set[Tuple[int, int]] = set()
         self._dirty_dots: set[Tuple[int, int]] = set()
         self._dead_cache: set[bytes] = set()
+        self._line_count: int = 0
+        self._unknown_edges: set[Tuple[str, int, int]] = set()
+        for r in range(self.R + 1):
+            for c in range(self.C):
+                self._unknown_edges.add(("h", r, c))
+        for r in range(self.R):
+            for c in range(self.C + 1):
+                self._unknown_edges.add(("v", r, c))
 
     def _vertex_index(self, r: int, c: int) -> int:
         return r * (self.C + 1) + c
@@ -100,6 +108,9 @@ class SlitherlinkState:
         if cur == val:
             return
         self._trail.append((kind, r, c))
+        self._unknown_edges.discard((kind, r, c))
+        if val == self.LINE:
+            self._line_count += 1
         if kind == "h":
             self.h[r][c] = val
         else:
@@ -138,6 +149,9 @@ class SlitherlinkState:
         trail_cp, uf_cp, cycle_cp = checkpoint
         while len(self._trail) > trail_cp:
             kind, r, c = self._trail.pop()
+            if self.get(kind, r, c) == self.LINE:
+                self._line_count -= 1
+            self._unknown_edges.add((kind, r, c))
             if kind == "h":
                 self.h[r][c] = self.UNKNOWN
             else:
@@ -209,9 +223,13 @@ class SlitherlinkState:
         return changed
 
     def _propagate_basic_patterns(self) -> bool:
+        """高级局部模式匹配 —— 大幅减少回溯深度。"""
         changed = False
-        for r in range(self.R):
-            for c in range(self.C - 1):
+        R, C = self.R, self.C
+
+        # ── 1. 水平相邻 3-3：外侧竖边 = LINE ──
+        for r in range(R):
+            for c in range(C - 1):
                 if self.grid[r][c] == 3 and self.grid[r][c + 1] == 3:
                     if self.v[r][c] == self.UNKNOWN:
                         self.set("v", r, c, self.LINE)
@@ -219,8 +237,10 @@ class SlitherlinkState:
                     if self.v[r][c + 2] == self.UNKNOWN:
                         self.set("v", r, c + 2, self.LINE)
                         changed = True
-        for r in range(self.R - 1):
-            for c in range(self.C):
+
+        # ── 2. 垂直相邻 3-3：外侧横边 = LINE ──
+        for r in range(R - 1):
+            for c in range(C):
                 if self.grid[r][c] == 3 and self.grid[r + 1][c] == 3:
                     if self.h[r][c] == self.UNKNOWN:
                         self.set("h", r, c, self.LINE)
@@ -228,12 +248,13 @@ class SlitherlinkState:
                     if self.h[r + 2][c] == self.UNKNOWN:
                         self.set("h", r + 2, c, self.LINE)
                         changed = True
+
         return changed
 
     def _check_cycle(self) -> None:
         if not self._cycle_detected:
             return
-        total_line = sum(v == self.LINE for row in self.h for v in row) + sum(v == self.LINE for row in self.v for v in row)
+        total_line = self._line_count
         if total_line < 4:
             return
         adj = {}
@@ -339,25 +360,19 @@ class SlitherlinkState:
         return len(seen) == len(adj)
 
     def find_unknown(self) -> Optional[Tuple[str, int, int]]:
+        if not self._unknown_edges:
+            return None
         best = None
         best_score = -1
-        for r in range(self.R + 1):
-            for c in range(self.C):
-                if self.h[r][c] == self.UNKNOWN:
-                    score = self._edge_priority("h", r, c)
-                    if score > best_score:
-                        best_score = score
-                        best = ("h", r, c)
-        for r in range(self.R):
-            for c in range(self.C + 1):
-                if self.v[r][c] == self.UNKNOWN:
-                    score = self._edge_priority("v", r, c)
-                    if score > best_score:
-                        best_score = score
-                        best = ("v", r, c)
+        for kind, r, c in self._unknown_edges:
+            score = self._edge_priority(kind, r, c)
+            if score > best_score:
+                best_score = score
+                best = (kind, r, c)
         return best
 
     def _edge_priority(self, kind: str, r: int, c: int) -> int:
+        """改进的启发式：优先选择约束强的边进行分支。"""
         score = 0
         cells = []
         if kind == "h":
@@ -370,15 +385,38 @@ class SlitherlinkState:
                 cells.append((r, c - 1))
             if c < self.C:
                 cells.append((r, c))
+
         for rr, cc in cells:
-            if self.grid[rr][cc] is not None:
-                score += 10
+            num = self.grid[rr][cc]
+            if num is not None:
+                score += 20  # 与编号格子相邻的边优先
                 vals = [self.get(k, er, ec) for k, er, ec in self.cell_edges(rr, cc)]
                 known = sum(v != self.UNKNOWN for v in vals)
+                line_count = vals.count(self.LINE)
+                cross_count = vals.count(self.CROSS)
                 unknown = 4 - known
-                score += (4 - unknown) * 3 + known * 2
+                # 已知信息越多、越接近满足数字，优先级越高
+                if unknown > 0:
+                    urgency = (num - line_count) / unknown  # 剩余需要填的 LINE 占比
+                    score += int(urgency * 15) + known * 5
+                # 数字为 0 或 3 的格子约束更强
+                if num == 0 or num == 3:
+                    score += 10
             else:
-                score += 1
+                score += 2  # 与空格相邻也有一定价值
+
+        # 靠近已确定 LINE 边的未知边优先级更高（连线连续性）
+        if kind == "h":
+            d1, d2 = self.dot_edges(r, c), self.dot_edges(r, c + 1)
+        else:
+            d1, d2 = self.dot_edges(r, c), self.dot_edges(r + 1, c)
+        for dot_set in (d1, d2):
+            line_deg = sum(1 for ek, er, ec in dot_set if self.get(ek, er, ec) == self.LINE)
+            if line_deg == 1:
+                score += 30  # 端点已有 1 条 LINE 的边优先（可能形成连线）
+            elif line_deg == 2:
+                score -= 50  # 端点已有 2 条 LINE，该边只能是 CROSS
+
         return score
 
     def solve(self) -> Optional["SlitherlinkState"]:
