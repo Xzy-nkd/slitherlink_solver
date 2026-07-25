@@ -227,27 +227,70 @@ class SlitherlinkState:
         changed = False
         R, C = self.R, self.C
 
-        # ── 1. 水平相邻 3-3：外侧竖边 = LINE ──
+        # ── 1. 水平相邻 3-3：外侧 + 共用边 = LINE ──
         for r in range(R):
             for c in range(C - 1):
                 if self.grid[r][c] == 3 and self.grid[r][c + 1] == 3:
+                    for cc in (c, c + 1, c + 2):  # 左外侧 / 共用 / 右外侧
+                        if self.v[r][cc] == self.UNKNOWN:
+                            self.set("v", r, cc, self.LINE)
+                            changed = True
+
+        # ── 2. 垂直相邻 3-3：外侧 + 共用边 = LINE ──
+        for r in range(R - 1):
+            for c in range(C):
+                if self.grid[r][c] == 3 and self.grid[r + 1][c] == 3:
+                    for rr in (r, r + 1, r + 2):  # 上外侧 / 共用 / 下外侧
+                        if self.h[rr][c] == self.UNKNOWN:
+                            self.set("h", rr, c, self.LINE)
+                            changed = True
+
+        # ── 3. 对角 3-3（左上-右下）：远离对面的边 = LINE ──
+        for r in range(R - 1):
+            for c in range(C - 1):
+                if self.grid[r][c] == 3 and self.grid[r + 1][c + 1] == 3:
+                    # 左上 3 远离右下 3 的边：上 + 左
+                    if self.h[r][c] == self.UNKNOWN:
+                        self.set("h", r, c, self.LINE)
+                        changed = True
                     if self.v[r][c] == self.UNKNOWN:
                         self.set("v", r, c, self.LINE)
+                        changed = True
+                    # 右下 3 远离左上 3 的边：下 + 右
+                    if self.h[r + 2][c + 1] == self.UNKNOWN:
+                        self.set("h", r + 2, c + 1, self.LINE)
+                        changed = True
+                    if self.v[r + 1][c + 2] == self.UNKNOWN:
+                        self.set("v", r + 1, c + 2, self.LINE)
+                        changed = True
+
+        # ── 4. 对角 3-3（右上-左下）：远离对面的边 = LINE ──
+        for r in range(R - 1):
+            for c in range(C - 1):
+                if self.grid[r][c + 1] == 3 and self.grid[r + 1][c] == 3:
+                    # 右上 3 远离左下 3 的边：上 + 右
+                    if self.h[r][c + 1] == self.UNKNOWN:
+                        self.set("h", r, c + 1, self.LINE)
                         changed = True
                     if self.v[r][c + 2] == self.UNKNOWN:
                         self.set("v", r, c + 2, self.LINE)
                         changed = True
-
-        # ── 2. 垂直相邻 3-3：外侧横边 = LINE ──
-        for r in range(R - 1):
-            for c in range(C):
-                if self.grid[r][c] == 3 and self.grid[r + 1][c] == 3:
-                    if self.h[r][c] == self.UNKNOWN:
-                        self.set("h", r, c, self.LINE)
-                        changed = True
+                    # 左下 3 远离右上 3 的边：下 + 左
                     if self.h[r + 2][c] == self.UNKNOWN:
                         self.set("h", r + 2, c, self.LINE)
                         changed = True
+                    if self.v[r + 1][c] == self.UNKNOWN:
+                        self.set("v", r + 1, c, self.LINE)
+                        changed = True
+
+        # ── 5. 0 格子的四条边显式设为 CROSS（加速） ──
+        for r in range(R):
+            for c in range(C):
+                if self.grid[r][c] == 0:
+                    for kind, rr, cc in self.cell_edges(r, c):
+                        if self.get(kind, rr, cc) == self.UNKNOWN:
+                            self.set(kind, rr, cc, self.CROSS)
+                            changed = True
 
         return changed
 
