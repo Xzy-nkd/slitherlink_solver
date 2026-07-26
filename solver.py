@@ -283,7 +283,65 @@ class SlitherlinkState:
                         self.set("v", r + 1, c, self.LINE)
                         changed = True
 
-        # ── 5. 0 格子的四条边显式设为 CROSS（加速） ──
+        # ── 5. 角上 3：两条棋盘外侧的边 = LINE ──
+        #    （角点度数约束 + 数字 3 共同迫使两边界边必为 LINE）
+        if self.grid[0][0] == 3:
+            if self.h[0][0] == self.UNKNOWN:
+                self.set("h", 0, 0, self.LINE)
+                changed = True
+            if self.v[0][0] == self.UNKNOWN:
+                self.set("v", 0, 0, self.LINE)
+                changed = True
+        if self.grid[0][C - 1] == 3:
+            if self.h[0][C - 1] == self.UNKNOWN:
+                self.set("h", 0, C - 1, self.LINE)
+                changed = True
+            if self.v[0][C] == self.UNKNOWN:
+                self.set("v", 0, C, self.LINE)
+                changed = True
+        if self.grid[R - 1][0] == 3:
+            if self.h[R][0] == self.UNKNOWN:
+                self.set("h", R, 0, self.LINE)
+                changed = True
+            if self.v[R - 1][0] == self.UNKNOWN:
+                self.set("v", R - 1, 0, self.LINE)
+                changed = True
+        if self.grid[R - 1][C - 1] == 3:
+            if self.h[R][C - 1] == self.UNKNOWN:
+                self.set("h", R, C - 1, self.LINE)
+                changed = True
+            if self.v[R - 1][C] == self.UNKNOWN:
+                self.set("v", R - 1, C, self.LINE)
+                changed = True
+
+        # ── 6. 3 的顶点已有外连线 → 远离该顶点的两边 = LINE ──
+        for r in range(R):
+            for c in range(C):
+                if self.grid[r][c] != 3:
+                    continue
+                cell_set = {("h", r, c), ("v", r, c + 1), ("h", r + 1, c), ("v", r, c)}
+                # 四个顶点 → 各自远离的两条 cell 边
+                verts = [
+                    (r, c,     ("v", r, c + 1), ("h", r + 1, c)),   # TL → RIGHT, BOTTOM
+                    (r, c + 1, ("v", r, c),     ("h", r + 1, c)),   # TR → LEFT,  BOTTOM
+                    (r + 1, c + 1, ("v", r, c), ("h", r, c)),       # BR → LEFT,  TOP
+                    (r + 1, c, ("v", r, c + 1), ("h", r, c)),       # BL → RIGHT, TOP
+                ]
+                for vr, vc, f1, f2 in verts:
+                    has_outside = False
+                    for ek, er, ec in self.dot_edges(vr, vc):
+                        if (ek, er, ec) in cell_set:
+                            continue
+                        if self.get(ek, er, ec) == self.LINE:
+                            has_outside = True
+                            break
+                    if has_outside:
+                        for fk, fr, fc in (f1, f2):
+                            if self.get(fk, fr, fc) == self.UNKNOWN:
+                                self.set(fk, fr, fc, self.LINE)
+                                changed = True
+
+        # ── 7. 0 格子的四条边显式设为 CROSS（加速） ──
         for r in range(R):
             for c in range(C):
                 if self.grid[r][c] == 0:
