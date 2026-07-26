@@ -14,10 +14,11 @@ import sys
 from pathlib import Path
 
 from solver import solve_puzzle
+from sat_solver import solve_sat
 from image_parser import parse_input, IMAGE_EXTENSIONS
 
 
-def run_cli(path: Path, show_steps: bool, debug: bool = False) -> int:
+def run_cli(path: Path, show_steps: bool, use_sat: bool = False, debug: bool = False) -> int:
     """命令行模式：保持原有字符画输出，支持文本或图片输入。"""
     try:
         grid = parse_input(path, debug=debug)
@@ -30,12 +31,20 @@ def run_cli(path: Path, show_steps: bool, debug: bool = False) -> int:
         print(' '.join(str(x) if x is not None else '.' for x in row))
     print()
 
-    solution = solve_puzzle(grid)
+    if use_sat:
+        import time
+        t0 = time.time()
+        solution = solve_sat(grid)
+        elapsed = time.time() - t0
+        print(f'(SAT 求解耗时: {elapsed:.3f}s)')
+    else:
+        solution = solve_puzzle(grid)
+
     if solution is None:
         print('未找到解。')
         return 1
 
-    if show_steps:
+    if show_steps and not use_sat:
         print('约束传播完成状态：')
         print(solution.render())
         print()
@@ -52,6 +61,8 @@ def main():
                         help='使用命令行字符画输出，不启动图形界面')
     parser.add_argument('--steps', action='store_true',
                         help='打印传播后的中间状态（仅与 --cli 一起使用）')
+    parser.add_argument('--sat', action='store_true',
+                        help='使用 SAT 求解器（Glucose3，速度极快，适合大谜题）')
     parser.add_argument('--debug', action='store_true',
                         help='图片解析调试模式：输出带网格线和识别结果的调试图（仅对图片文件有效）')
     args = parser.parse_args()
@@ -67,7 +78,7 @@ def main():
         if puzzle_path is None:
             print('命令行模式需要指定谜题文件路径。', file=sys.stderr)
             sys.exit(1)
-        sys.exit(run_cli(puzzle_path, args.steps, debug=args.debug))
+        sys.exit(run_cli(puzzle_path, args.steps, use_sat=args.sat, debug=args.debug))
 
     # 默认启动图形界面
     try:

@@ -18,6 +18,12 @@ import time
 from solver import solve_puzzle, SlitherlinkState
 from image_parser import parse_input, IMAGE_EXTENSIONS
 
+try:
+    from sat_solver import solve_sat
+    _HAS_SAT = True
+except ImportError:
+    _HAS_SAT = False
+
 
 class SlitherlinkGUI:
     """数回求解器的主窗口。"""
@@ -144,25 +150,43 @@ class SlitherlinkGUI:
         self._solving = True
         self.solve_btn.configure(state=tk.DISABLED)
 
-        self.status_var.set("正在求解...")
-        self.root.update_idletasks()
+        if _HAS_SAT:
+            self.status_var.set("正在求解（SAT）...")
+            self.root.update_idletasks()
+            try:
+                import time
+                t0 = time.time()
+                solution = solve_sat(self.original_grid)
+                elapsed = time.time() - t0
+                if solution is None:
+                    self.status_var.set("未找到解。")
+                    messagebox.showinfo("求解结果", "未找到满足所有约束的解。")
+                else:
+                    self.state = solution
+                    self._render(solution)
+                    self.status_var.set(f"求解完成（SAT, {elapsed:.3f}s）。")
+            except Exception as exc:
+                self.status_var.set(f"SAT 求解出错：{exc}，回退到回溯求解...")
+                self._solve_backtrack()
+        else:
+            self._solve_backtrack()
+        self._solving = False
+        self.solve_btn.configure(state=tk.NORMAL)
 
+    def _solve_backtrack(self) -> None:
+        """使用回溯求解器求解（较慢但不需要额外依赖）。"""
         try:
             solution = solve_puzzle(self.original_grid)
             if solution is None:
                 self.status_var.set("未找到解。")
                 messagebox.showinfo("求解结果", "未找到满足所有约束的解。")
                 return
-
             self.state = solution
             self._render(solution)
-            self.status_var.set("求解完成。")
+            self.status_var.set("求解完成（回溯）。")
         except Exception as exc:
             self.status_var.set(f"求解出错：{exc}")
             messagebox.showerror("求解错误", str(exc))
-        finally:
-            self._solving = False
-            self.solve_btn.configure(state=tk.NORMAL)
 
     def _on_propagate_click(self) -> None:
         """点击“显示传播状态”按钮：仅执行约束传播，不进入回溯。"""

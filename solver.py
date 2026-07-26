@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import random as _random
 import heapq
+import random as _random_module  # 用于随机值排序
 
 # ── Zobrist 哈希种子（模块级，所有状态共享）──
 _ZOBRIST_R = _random.getrandbits(64)
@@ -586,6 +587,12 @@ class SlitherlinkState:
         return score
 
     def solve(self) -> Optional["SlitherlinkState"]:
+        # ── 节点限制检查（用于重启策略）──
+        self._node_count = getattr(self, '_node_count', 0) + 1
+        node_limit = getattr(self, '_node_limit', 0)
+        if node_limit > 0 and self._node_count > node_limit:
+            return None  # 超限，触发重启
+
         key = self._state_key()
         if key in self._dead_cache:
             return None
@@ -652,6 +659,9 @@ class SlitherlinkState:
                         prefer_line_first = False
                         break
         order = (self.LINE, self.CROSS) if prefer_line_first else (self.CROSS, self.LINE)
+        # 50% 概率翻转顺序，避免系统性偏差陷入搜索陷阱
+        if _random_module.random() < 0.5:
+            order = (order[1], order[0])
         for val in order:
             cp = self.save_state()
             try:
@@ -712,5 +722,10 @@ def parse_puzzle(text: str) -> List[List[Optional[int]]]:
     return grid
 
 
-def solve_puzzle(grid: List[List[Optional[int]]]) -> Optional[SlitherlinkState]:
-    return SlitherlinkState(grid).solve()
+def solve_puzzle(grid: List[List[Optional[int]]],
+                  node_limit: int = 0) -> Optional[SlitherlinkState]:
+    """求解谜题。node_limit>0 时限制搜索节点数（用于重启策略）。"""
+    state = SlitherlinkState(grid)
+    state._node_count = 0
+    state._node_limit = node_limit
+    return state.solve()
