@@ -14,8 +14,13 @@ import sys
 from pathlib import Path
 
 from solver import solve_puzzle
-from sat_solver import solve_sat
 from image_parser import parse_input, IMAGE_EXTENSIONS
+
+try:
+    from sat_solver import solve_sat
+    _HAS_SAT = True
+except ImportError:
+    _HAS_SAT = False
 
 
 def run_cli(path: Path, show_steps: bool, use_sat: bool = False, debug: bool = False) -> int:
@@ -32,6 +37,9 @@ def run_cli(path: Path, show_steps: bool, use_sat: bool = False, debug: bool = F
     print()
 
     if use_sat:
+        if not _HAS_SAT:
+            print('错误：SAT 求解器需要 python-sat 库。请运行: pip install python-sat', file=sys.stderr)
+            return 1
         import time
         t0 = time.time()
         solution = solve_sat(grid)
