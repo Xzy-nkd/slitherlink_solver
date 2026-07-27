@@ -401,26 +401,209 @@ def _estimate_grid_from_numbers(
     return R, C, h_lines, v_lines
 
 
-def _digit_templates(size: int = 64) -> dict:
-    """生成 0-3 的标准数字模板（白字黑底），模拟常见截图字体比例。
-    使用更大的画布和更细的字体粗细来提高 NCC 区分度。"""
+def _per_cell_otsu(cell_img: Image.Image) -> Image.Image:
+    """对单个单元格应用 Otsu 阈值二值化（白字黑底 → 白=255前景）。"""
+    hist = cell_img.histogram()
+    total = sum(hist)
+    if total == 0:
+        return Image.new('L', cell_img.size, 0)
+    sum_all = sum(i * hist[i] for i in range(256))
+    w_bg = 0; sum_bg = 0; max_var = 0; thresh = 128
+    for t in range(256):
+        w_bg += hist[t]
+        if w_bg == 0: continue
+        w_fg = total - w_bg
+        if w_fg == 0: break
+        sum_bg += t * hist[t]
+        m_bg = sum_bg / w_bg
+        m_fg = (sum_all - sum_bg) / w_fg
+        var_between = w_bg * w_fg * (m_bg - m_fg) ** 2
+        if var_between > max_var:
+            max_var = var_between; thresh = t
+    # 白字黑底：高于阈值为前景（白色=255）
+    return cell_img.point(lambda p: 255 if p > thresh else 0)
+
+
+def _clean_cell_otsu(cell_img: Image.Image) -> Image.Image:
+    """逐格 Otsu 二值化 + 移除角落孤立像素（网格点残留）。
+    
+    流程：
+    1. 逐格 Otsu 二值化
+    2. 仅移除与四角（3px范围内）相邻且面积 < 8 像素的连通组件
+       （这些通常是网格交点的残留，而非数字笔画）
+    """
+    bin_img = _per_cell_otsu(cell_img)
+    w, h = bin_img.size
+    if w < 6 or h < 6:
+        return bin_img
+
+    px = bin_img.load()
+    visited = [[False] * w for _ in range(h)]
+
+    # 定义四角区域（距角点3像素以内）
+    corners = [
+        (0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)
+    ]
+
+    def _near_corner(cx: int, cy: int) -> bool:
+        for kx, ky in corners:
+            if abs(cx - kx) <= 3 and abs(cy - ky) <= 3:
+                return True
+        return False
+
+    # 找出所有白像素连通组件
+    for y in range(h):
+        for x in range(w):
+            if px[x, y] > 127 and not visited[y][x]:
+                stack = [(x, y)]
+                visited[y][x] = True
+                comp = []
+                touches_corner = False
+                while stack:
+                    cx, cy = stack.pop()
+                    comp.append((cx, cy))
+                    if _near_corner(cx, cy):
+                        touches_corner = True
+                    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nx, ny = cx + dx, cy + dy
+                        if 0 <= nx < w and 0 <= ny < h:
+                            if px[nx, ny] > 127 and not visited[ny][nx]:
+                                visited[ny][nx] = True
+                                stack.append((nx, ny))
+
+                # 小面积 + 接触角落 → 移除
+                if touches_corner and len(comp) < 8:
+                    for cx, cy in comp:
+                        px[cx, cy] = 0
+
+    return bin_img
+
+
+def _projection_profile(bin_img: Image.Image):
+    """计算二值图像的水平投影（每行白像素数）和垂直投影（每列白像素数）。
+    返回 (h_proj, v_proj)，均已归一化（除以最大值）。"""
+    w, h = bin_img.size
+    px = bin_img.load()
+    h_proj = [0] * h
+    v_proj = [0] * w
+    for y in range(h):
+        row_sum = 0
+        for x in range(w):
+            if px[x, y] > 127:
+                row_sum += 1
+                v_proj[x] += 1
+        h_proj[y] = row_sum
+    max_h = max(h_proj) if h_proj else 1
+    max_v = max(v_proj) if v_proj else 1
+    h_proj = [v / max_h for v in h_proj]
+    v_proj = [v / max_v for v in v_proj]
+    return h_proj, v_proj
+
+
+def _compute_x_shift(bin_cell: Image.Image) -> Optional[float]:
+    """计算水平重心从上到下的偏移量。
+    
+    正值 = 底部比顶部偏右；负值 = 底部比顶部偏左。
+    对于数字 2，笔画从右上到左下，因此 x_shift 为显著负值（≈-1.75）。
+    对于数字 3，上下对称，x_shift ≈ 0。
+    """
+    w, h = bin_cell.size
+    px = bin_cell.load()
+    rows_with_content = []
+    for y in range(h):
+        xs = [x for x in range(w) if px[x, y] > 127]
+        if xs:
+            rows_with_content.append(sum(xs) / len(xs))
+    if len(rows_with_content) < 4:
+        return None
+    n = len(rows_with_content)
+    third = max(1, n // 3)
+    top_x = sum(rows_with_content[:third]) / third
+    bot_x = sum(rows_with_content[-third:]) / third
+    return bot_x - top_x
+
+
+def _classify_by_shape(bin_cell: Image.Image, features: dict) -> Optional[int]:
+    """基于形状特征分类数字 0-3。
+    
+    决策树（跨谜题验证：5×5 到 50×40，格子 20~114px）：
+    1. 有孔洞 → 0
+    2. 纵横比 < 0.68 → 1（窄）
+    3. x_shift < -0.75 → 2（对角线：右上→左下）
+    4. 其余 → 3（上下对称）
+    """
+    holes = _count_holes(bin_cell)
+    aspect = features['aspect']
+
+    # 0: 有孔洞
+    if holes >= 1 and aspect > 0.4:
+        return 0
+
+    # 1: 窄长形状
+    if aspect < 0.68:
+        return 1
+
+    # 2 vs 3: 水平重心偏移（-0.75 经验证为最佳全局阈值）
+    x_shift = _compute_x_shift(bin_cell)
+    if x_shift is not None and x_shift < -0.75:
+        return 2
+
+    # 默认为 3
+    if aspect >= 0.68:
+        return 3
+
+    return None
+
+
+def _learn_templates(
+    cell_images: List[Image.Image],
+    labels: List[int],
+    size: int = 64,
+) -> dict:
+    """从已分类的单元格构建真实数字模板。
+    对每个数字取所有样本的归一化平均图像。"""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for img, lbl in zip(cell_images, labels):
+        if lbl is not None and 0 <= lbl <= 3:
+            norm = _center_content(img, size)
+            groups[lbl].append(norm)
+
     templates = {}
     for digit in range(4):
-        # 用更大画布（128x128）生成，再缩放到64x64以获得抗锯齿效果
-        big = Image.new('L', (120, 120), 0)
-        draw = ImageDraw.Draw(big)
-        try:
-            # 使用更细的线条——较低的 font_size 使线条相对更细
-            draw.text((60, 60), str(digit), fill=255, anchor='mm', font_size=64)
-        except TypeError:
-            draw.text((35, 25), str(digit), fill=255)
-        # 缩放时保留抗锯齿
-        templates[digit] = big.resize((size, size), Image.Resampling.LANCZOS)
+        imgs = groups.get(digit, [])
+        if len(imgs) >= 2:
+            # 平均融合
+            avg = Image.new('F', (size, size), 0.0)
+            for im in imgs:
+                px = im.load()
+                apx = avg.load()
+                for y in range(size):
+                    for x in range(size):
+                        apx[x, y] += px[x, y] / 255.0
+            count = len(imgs)
+            out = Image.new('L', (size, size), 0)
+            opx = out.load()
+            apx = avg.load()
+            for y in range(size):
+                for x in range(size):
+                    opx[x, y] = int(min(255, (apx[x, y] / count) * 255))
+            templates[digit] = out
+        else:
+            # 样本不足，用合成模板兜底
+            templates[digit] = _synthetic_template(digit, size)
     return templates
 
 
-# 预生成模板
-_TEMPLATES = _digit_templates(64)
+def _synthetic_template(digit: int, size: int = 64) -> Image.Image:
+    """生成合成数字模板（兜底）。"""
+    big = Image.new('L', (120, 120), 0)
+    draw = ImageDraw.Draw(big)
+    try:
+        draw.text((60, 60), str(digit), fill=255, anchor='mm', font_size=64)
+    except TypeError:
+        draw.text((35, 25), str(digit), fill=255)
+    return big.resize((size, size), Image.Resampling.LANCZOS)
 
 
 def _similarity(a: Image.Image, b: Image.Image) -> float:
@@ -593,80 +776,75 @@ def _center_content(img: Image.Image, size: int = 64) -> Image.Image:
     return out
 
 
-def _recognize_digit(cell_img: Image.Image) -> Optional[int]:
+def _recognize_digit(cell_gray: Image.Image,
+                     templates: Optional[dict] = None) -> Optional[int]:
+    """识别单元格中的数字（0-3）或返回 None（空白格）。
+
+    流程：
+    1. 逐格 Otsu 二值化（关键改进：不用全局阈值）
+    2. 形状特征分类（孔洞→0, 纵横比→1, 投影→2/3）
+    3. 若有自学习模板，用 NCC 作为辅助校验
     """
-    识别单元格中的数字（0-3）或返回 None（空白格）。
-    以 NCC 模板匹配为核心，几何特征辅助处理模糊情况。
-    """
-    if cell_img.size[0] < 5 or cell_img.size[1] < 5:
+    if cell_gray.size[0] < 5 or cell_gray.size[1] < 5:
         return None
 
-    normalized = _center_content(cell_img, size=64)
-    pixels = normalized.load()
-    mean_brightness = sum(pixels[x, y] for y in range(64) for x in range(64)) / (64 * 64)
+    # ── 逐格 Otsu 二值化 ──
+    bin_cell = _clean_cell_otsu(cell_gray)
 
-    # 平均亮度过低视为空白
-    if mean_brightness < 5:
+    # 检查是否空白
+    w, h = bin_cell.size
+    px = bin_cell.load()
+    white_count = sum(1 for y in range(h) for x in range(w) if px[x, y] > 127)
+    fill_ratio = white_count / (w * h) if w * h > 0 else 0
+    if fill_ratio < 0.01 or white_count < 15:
         return None
 
-    # 轻微二值化以提取几何特征
-    bin_cell = normalized.point(lambda p: 255 if p > 100 else 0)
+    # ── 提取几何特征 ──
     features = _digit_features(bin_cell)
-    if features is None or features['filled_count'] < 20:
+    if features is None or features['filled_count'] < 15:
         return None
 
-    # ——— NCC 模板匹配：作为主要判断手段 ———
-    scores = {}
-    for digit, template in _TEMPLATES.items():
-        scores[digit] = _similarity(normalized, template)
+    # ── 形状分类 ──
+    shape_result = _classify_by_shape(bin_cell, features)
 
-    sorted_digits = sorted(scores, key=scores.get, reverse=True)
-    best = sorted_digits[0]
-    second = sorted_digits[1]
-    best_score = scores[best]
-    second_score = scores[second]
+    # ── 模板匹配辅助 ──
+    if templates and len(templates) >= 4:
+        normalized = _center_content(cell_gray, size=64)
+        scores = {d: _similarity(normalized, tmpl) for d, tmpl in templates.items()}
+        best_digit = max(scores, key=scores.get)
+        best_score = scores[best_digit]
+        second_score = sorted(scores.values(), reverse=True)[1]
 
-    # 先做确定性判断：有孔洞的是 0（3 可能有闭合区域，需谨慎）
-    holes = _count_holes(bin_cell)
-    if holes >= 1:
-        # 数字 0 有 1 个孔洞且宽高比接近 1
-        return 0
+        # NCC 有明确优势时采用 NCC 结果
+        if best_score > 0.35 and best_score - second_score > 0.05:
+            return best_digit
 
-    # ——— NCC 模板匹配优先 ———
-    # NCC 最佳匹配有显著优势时直接采用
-    if best_score > 0.20 and best_score - second_score > 0.03:
-        return best
+        # 形状结果与 NCC 一致 → 高置信度
+        if shape_result is not None and shape_result == best_digit and best_score > 0.2:
+            return shape_result
 
-    # 高宽比极窄的才是 1（放宽阈值避免 3 被误判为 1）
-    aspect = features['aspect']
-    if aspect < 0.35:
-        return 1
+        # NCC 分数不够 → 信任形状分类
+        if shape_result is not None:
+            return shape_result
 
-    # ——— NCC + 几何特征辅助判断 2 vs 3 ———
-    quads = features['quads']
-    top_left = quads[0]
-    top_right = quads[1]
-    bottom_left = quads[2]
-    bottom_right = quads[3]
+        # 都不确定，用 NCC 最佳
+        if best_score > 0.15:
+            return best_digit
+    else:
+        # 无模板：纯形状分类
+        if shape_result is not None:
+            return shape_result
 
-    # 上半部中靠右的比例
-    top_right_ratio = top_right / (top_left + top_right + 1e-8)
-    # 下半部中靠右的比例
-    bottom_right_ratio = bottom_right / (bottom_left + bottom_right + 1e-8)
-
-    # 用更强的 2/3 区分条件
-    is_3_by_shape = (top_right_ratio > 0.55 and bottom_right_ratio > 0.55)
-    is_2_by_shape = (top_right_ratio < 0.48 and bottom_right_ratio > 0.52)
-
-    # 如果形状特征明确，采用形状判断
-    if is_2_by_shape and not is_3_by_shape:
-        return 2
-    if is_3_by_shape and not is_2_by_shape:
-        return 3
-
-    # 如果形状不明确，用 NCC 结果
-    if best_score > 0.08:
-        return best
+        # 回退：用纵横比粗略判断
+        aspect = features['aspect']
+        if aspect < 0.68:
+            return 1
+        # 2 vs 3: x_shift
+        x_shift = _compute_x_shift(bin_cell)
+        if x_shift is not None and x_shift < -0.75:
+            return 2
+        if aspect >= 0.68:
+            return 3
 
     return None
 
@@ -781,37 +959,176 @@ def parse_image(path: Path, debug: bool = False) -> List[List[Optional[int]]]:
                 f'{len(numbers)} 个数字组件，但无法形成规则网格。'
             )
 
-    # ——— 提取每个单元格，识别数字 ———
-    # 计算单元格平均尺寸，用于设置合适的边距
+    # ——— 提取每个单元格，两轮识别数字 ———
+    # 计算单元格平均尺寸
     avg_v_gap = sum(v_lines[i+1] - v_lines[i] for i in range(len(v_lines)-1)) / (len(v_lines)-1)
     avg_h_gap = sum(h_lines[i+1] - h_lines[i] for i in range(len(h_lines)-1)) / (len(h_lines)-1)
-    # 边距设为格宽的约 25%，确保完全排除四角黑点
-    big_margin = max(margin, int(min(avg_v_gap, avg_h_gap) * 0.28))
+    # 边距：12% 保留足够像素，角落残留由 _clean_cell_otsu 处理
+    small_margin = max(2, min(int(avg_v_gap * 0.12), int(avg_h_gap * 0.12)))
 
-    grid: List[List[Optional[int]]] = []
+    # 第一阶段：从原始灰度图裁剪所有单元格
+    cell_crops = []  # (r, c, cell_gray_inverted)
+    cell_bins = []   # (r, c, otsu_binary)
     for r in range(R):
-        row = []
         for c in range(C):
-            cell_bin = _extract_cell(
-                binary,
-                v_lines[c], h_lines[r],
-                v_lines[c + 1], h_lines[r + 1],
-                margin=big_margin,
-            )
-            # 先用二值图判断是否为空白
-            if _is_blank(cell_bin):
-                row.append(None)
-                continue
+            x1, y1 = v_lines[c], h_lines[r]
+            x2, y2 = v_lines[c + 1], h_lines[r + 1]
+            left_m = min(x1 + small_margin, x2)
+            top_m = min(y1 + small_margin, y2)
+            right_m = max(x2 - small_margin, left_m + 1)
+            bottom_m = max(y2 - small_margin, top_m + 1)
+            cell_gray = ImageOps.invert(img.crop((left_m, top_m, right_m, bottom_m)))
+            cell_bin = _clean_cell_otsu(cell_gray)
+            cell_crops.append((r, c, cell_gray))
+            cell_bins.append((r, c, cell_bin))
 
-            cell_gray = _extract_cell(
-                gray,
-                v_lines[c], h_lines[r],
-                v_lines[c + 1], h_lines[r + 1],
-                margin=big_margin,
-            )
-            digit = _recognize_digit(cell_gray)
-            row.append(digit)
-        grid.append(row)
+    # 第一轮：决策树主导 + 合成 NCC 纠正 → 种子分类
+    # 策略：DT 对 0（孔洞）、1（窄）、2（x_shift）置信度高，但对 3 不可靠
+    # → 仅在 DT=3 时用合成 NCC 纠错，避免 NCC 对小格子的误判
+    first_labels: dict[Tuple[int, int], Optional[int]] = {}
+    seed_ncc_size = max(int(min(avg_v_gap, avg_h_gap)), 24)
+    syn_templates = {d: _synthetic_template(d, seed_ncc_size) for d in range(4)}
+
+    for (r, c, cell_gray), (_, _, bin_cell) in zip(cell_crops, cell_bins):
+        w, h = bin_cell.size
+        px = bin_cell.load()
+        wc = sum(1 for y in range(h) for x in range(w) if px[x, y] > 127)
+        if wc < 8:
+            first_labels[(r, c)] = None
+            continue
+
+        feat = _digit_features(bin_cell)
+        if feat is None:
+            first_labels[(r, c)] = None
+            continue
+
+        # ——— 决策树分类 ———
+        holes = _count_holes(bin_cell)
+        aspect = feat['aspect']
+
+        # 0: 有孔洞（高置信度）
+        if holes >= 1 and aspect > 0.4:
+            first_labels[(r, c)] = 0
+            continue
+
+        # 1: 窄长形状（高置信度）
+        if aspect < 0.68:
+            first_labels[(r, c)] = 1
+            continue
+
+        # 2 vs 3: x_shift 判断
+        x_shift = _compute_x_shift(bin_cell)
+        if x_shift is not None and x_shift < -0.75:
+            first_labels[(r, c)] = 2
+            continue
+
+        # DT 归类为 3（默认类别，最不可靠）→ 用合成 NCC 二次确认
+        scaled = cell_gray.resize((seed_ncc_size, seed_ncc_size), Image.Resampling.LANCZOS)
+        ncc_scores = {d: _similarity(scaled, tmpl) for d, tmpl in syn_templates.items()}
+        ncc_best = max(ncc_scores, key=ncc_scores.get)
+        ncc_best_score = ncc_scores[ncc_best]
+
+        if ncc_best != 3 and ncc_best_score > 0.30:
+            first_labels[(r, c)] = ncc_best  # NCC 纠正 DT 误判
+        else:
+            first_labels[(r, c)] = 3
+
+    # 构建原生分辨率模板
+    sample_imgs = {0: [], 1: [], 2: [], 3: []}
+    for r, c, cell_gray in cell_crops:
+        lbl = first_labels.get((r, c))
+        if lbl is not None and 0 <= lbl <= 3:
+            sample_imgs[lbl].append(cell_gray)
+
+    native_templates = {}
+    # 统一模板尺寸：取所有已构建模板中的最大尺寸，确保 NCC 可比较
+    tsize_candidates = []
+    temp_templates = {}
+    for digit in range(4):
+        imgs = sample_imgs.get(digit, [])
+        if len(imgs) >= 2:
+            max_w = max(im.size[0] for im in imgs)
+            max_h = max(im.size[1] for im in imgs)
+            tsize = max(max_w, max_h, 18)
+            tsize_candidates.append(tsize)
+            resized = []
+            for im in imgs:
+                scaled = im.resize((tsize, tsize), Image.Resampling.LANCZOS)
+                resized.append(scaled)
+            avg = Image.new('F', (tsize, tsize), 0.0)
+            for im in resized:
+                ipx = im.load()
+                apx = avg.load()
+                for y in range(tsize):
+                    for x in range(tsize):
+                        apx[x, y] += ipx[x, y] / 255.0
+            n = len(resized)
+            out = Image.new('L', (tsize, tsize), 0)
+            opx = out.load()
+            apx = avg.load()
+            for y in range(tsize):
+                for x in range(tsize):
+                    opx[x, y] = int(min(255, (apx[x, y] / n) * 255))
+            temp_templates[digit] = out
+        else:
+            temp_templates[digit] = None  # 稍后用统一尺寸的合成模板
+
+    # 统一尺寸
+    common_tsize = max(tsize_candidates) if tsize_candidates else 24
+    for digit in range(4):
+        if temp_templates.get(digit) is not None:
+            if temp_templates[digit].size[0] != common_tsize:
+                native_templates[digit] = temp_templates[digit].resize(
+                    (common_tsize, common_tsize), Image.Resampling.LANCZOS)
+            else:
+                native_templates[digit] = temp_templates[digit]
+        else:
+            native_templates[digit] = _synthetic_template(digit, common_tsize)
+
+    # 第二轮：NCC 模板匹配主导，决策树作为回退
+    grid: List[List[Optional[int]]] = [[None] * C for _ in range(R)]
+    for r, c, cell_gray in cell_crops:
+        tsize = native_templates[0].size[0]
+        scaled = cell_gray.resize((tsize, tsize), Image.Resampling.LANCZOS)
+        scores = {d: _similarity(scaled, tmpl) for d, tmpl in native_templates.items()}
+        best = max(scores, key=scores.get)
+        best_score = scores[best]
+        sorted_scores = sorted(scores.values(), reverse=True)
+        second_score = sorted_scores[1] if len(sorted_scores) > 1 else 0
+        margin = best_score - second_score
+
+        # NCC 极高置信度 + 明显优势 → 直接采用
+        if best_score > 0.50 and margin > 0.05:
+            grid[r][c] = best
+        # NCC 极高置信度但优势小 → 参考第一轮标签
+        elif best_score > 0.50:
+            lbl = first_labels.get((r, c))
+            if lbl is not None and lbl != best:
+                grid[r][c] = lbl  # 保护第一轮标签
+            else:
+                grid[r][c] = best
+        # NCC 高置信度 + 明显优势 → 直接采用
+        elif best_score > 0.35 and margin > 0.03:
+            grid[r][c] = best
+        # NCC 高置信度但优势小 → 参考第一轮标签
+        elif best_score > 0.35:
+            lbl = first_labels.get((r, c))
+            if lbl is not None and lbl != best:
+                grid[r][c] = lbl  # 保护第一轮标签
+            else:
+                grid[r][c] = best
+        # NCC 中等置信度 → 优先信任第一轮
+        elif best_score > 0.25:
+            lbl = first_labels.get((r, c))
+            if lbl is not None:
+                grid[r][c] = lbl
+            else:
+                grid[r][c] = best
+        # NCC 低置信度 → 回退到第一轮标签
+        else:
+            lbl = first_labels.get((r, c))
+            if lbl is not None:
+                grid[r][c] = lbl
 
     if debug:
         _save_debug_image(binary, h_lines, v_lines, grid, path)
