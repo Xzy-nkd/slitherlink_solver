@@ -1,6 +1,3 @@
 __pycache__/
 *.pyc
-recovered_solver.py
-solved.png
 session.json
-puzzle_loop_ui.png
