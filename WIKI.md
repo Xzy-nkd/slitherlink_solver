@@ -82,8 +82,6 @@ Slitherlink 属于**约束满足问题（CSP, Constraint Satisfaction Problem）
 
 **3-顶点-外侧 定式**：当一个顶点连接三个数字 3 时，该顶点的外侧边必为 LINE。
 
-> ⚠️ 对角 3-3 规则（"内角边必为 LINE"）在部分谜题配置下会导致错误推断，因此**未包含**在当前实现中。新模式的加入需经过充分验证。
-
 ### 早期环路检测（`_check_cycle` + `RollbackDSU`）
 
 避免无用搜索的关键机制：
